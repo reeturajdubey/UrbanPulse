@@ -5,7 +5,7 @@ from datetime import datetime
 from pyflink.common.typeinfo import Types
 from pyflink.common.watermark_strategy import WatermarkStrategy, Duration
 from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors.kafka import FlinkKafkaConsumer, FlinkKafkaProducer
+from pyflink.datastream.connectors.kafka import KafkaSource, KafkaSink, KafkaRecordSerializationSchema
 from pyflink.datastream.formats.json import JsonRowSerializationSchema
 from pyflink.datastream.functions import KeyedProcessFunction, MapFunction
 from pyflink.datastream.state import ValueStateDescriptor, MapStateDescriptor
@@ -131,54 +131,85 @@ class BusBunchingDetector(KeyedProcessFunction):
 
 
 def main():
-    env = StreamExecutionEnvironment.get_execution_environment()
-    # Add kafka connector jar if running locally (assuming standard setup)
-    # env.add_jars("file:///path/to/flink-sql-connector-kafka.jar")
+    import sys
+    from pathlib import Path
+    from pyflink.common import Configuration
+    config = Configuration()
+    config.set_string("python.executable", sys.executable)
+    config.set_string("python.client.executable", sys.executable)
+    env = StreamExecutionEnvironment.get_execution_environment(config)
+    jar_dir = Path(__file__).resolve().parent
+    env.add_jars(
+        jar_dir.joinpath("flink-connector-kafka.jar").as_uri(),
+        jar_dir.joinpath("kafka-clients.jar").as_uri(),
+    )
     
     # 1. AQI Emergency Pipeline
-    aqi_source = FlinkKafkaConsumer(
-        topics='urbanpulse.air_quality',
-        deserialization_schema=SimpleStringSchema(),
-        properties={'bootstrap.servers': KAFKA_BROKERS, 'group.id': 'flink_incident_group'}
-    )
-    aqi_stream = env.add_source(aqi_source)
-    aqi_alerts = aqi_stream.map(AQIAlertFunction()).filter(lambda x: x is not None)
+    aqi_source = KafkaSource.builder() \
+        .set_bootstrap_servers(KAFKA_BROKERS) \
+        .set_topics("urbanpulse.air_quality") \
+        .set_group_id("flink_incident_group") \
+        .set_value_only_deserializer(SimpleStringSchema()) \
+        .build()
+    def as_text(value):
+        # PyFlink UDFs often cross the Java boundary as bytes
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode("utf-8")
+        return value
+
+    aqi_stream = env.from_source(aqi_source, WatermarkStrategy.no_watermarks(), "AQI Source")
+    aqi_alerts = aqi_stream.map(AQIAlertFunction(), output_type=Types.STRING()) \
+        .filter(lambda x: x is not None) \
+        .map(as_text, output_type=Types.STRING())
     
     # 2. Traffic Gridlock Pipeline
-    signals_source = FlinkKafkaConsumer(
-        topics='urbanpulse.signals',
-        deserialization_schema=SimpleStringSchema(),
-        properties={'bootstrap.servers': KAFKA_BROKERS, 'group.id': 'flink_incident_group'}
-    )
-    signals_stream = env.add_source(signals_source)
+    signals_source = KafkaSource.builder() \
+        .set_bootstrap_servers(KAFKA_BROKERS) \
+        .set_topics("urbanpulse.signals") \
+        .set_group_id("flink_incident_group") \
+        .set_value_only_deserializer(SimpleStringSchema()) \
+        .build()
+    signals_stream = env.from_source(signals_source, WatermarkStrategy.no_watermarks(), "Signals Source")
     # Key by junction_id
     gridlock_alerts = signals_stream \
-        .key_by(lambda x: json.loads(x)["junction_id"]) \
-        .process(GridlockDetector())
+        .key_by(lambda x: json.loads(as_text(x))["junction_id"]) \
+        .process(GridlockDetector(), output_type=Types.STRING()) \
+        .map(as_text, output_type=Types.STRING())
         
     # 3. Bus Bunching Pipeline
-    bus_source = FlinkKafkaConsumer(
-        topics='urbanpulse.bus_gps',
-        deserialization_schema=SimpleStringSchema(),
-        properties={'bootstrap.servers': KAFKA_BROKERS, 'group.id': 'flink_incident_group'}
-    )
+    bus_source = KafkaSource.builder() \
+        .set_bootstrap_servers(KAFKA_BROKERS) \
+        .set_topics("urbanpulse.bus_gps") \
+        .set_group_id("flink_incident_group") \
+        .set_value_only_deserializer(SimpleStringSchema()) \
+        .build()
     # We assign watermarks for event time processing if needed, 
     # but here we use simple processing logic inside KeyedProcessFunction.
-    bus_stream = env.add_source(bus_source)
+    bus_stream = env.from_source(bus_source, WatermarkStrategy.no_watermarks(), "Bus Source")
     bunching_alerts = bus_stream \
-        .key_by(lambda x: json.loads(x)["route_id"]) \
-        .process(BusBunchingDetector())
+        .key_by(lambda x: json.loads(as_text(x))["route_id"]) \
+        .process(BusBunchingDetector(), output_type=Types.STRING()) \
+        .map(as_text, output_type=Types.STRING())
         
     # 4. Sink to urbanpulse.incidents
-    kafka_producer = FlinkKafkaProducer(
-        topic='urbanpulse.incidents',
-        serialization_schema=SimpleStringSchema(),
-        producer_config={'bootstrap.servers': KAFKA_BROKERS}
-    )
+    kafka_sink = KafkaSink.builder() \
+        .set_bootstrap_servers(KAFKA_BROKERS) \
+        .set_record_serializer(
+            KafkaRecordSerializationSchema.builder()
+                .set_topic("urbanpulse.incidents")
+                .set_value_serialization_schema(SimpleStringSchema())
+                .build()
+        ) \
+        .build()
     
-    aqi_alerts.add_sink(kafka_producer)
-    gridlock_alerts.add_sink(kafka_producer)
-    bunching_alerts.add_sink(kafka_producer)
+    # Console for local demo visibility; Kafka for downstream consumers
+    aqi_alerts.print("AQI_ALERT")
+    gridlock_alerts.print("GRIDLOCK_ALERT")
+    bunching_alerts.print("BUNCHING_ALERT")
+
+    aqi_alerts.sink_to(kafka_sink)
+    gridlock_alerts.sink_to(kafka_sink)
+    bunching_alerts.sink_to(kafka_sink)
     
     env.execute("UrbanPulse Flink Incident Detector")
 

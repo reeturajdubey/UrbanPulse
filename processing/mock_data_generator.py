@@ -123,26 +123,24 @@ def main():
     
     while True:
         try:
-            # 1. Bus GPS
-            anomaly_bus = random.random() < 0.05
+            # 1. Bus GPS — keep bunching pair active often so Flink can trip the 5-min SLA
+            anomaly_bus = random.random() < 0.35
             buses = generate_bus_gps(anomaly_bunching=anomaly_bus)
             for bus in buses:
                 val = json.dumps(bus)
                 if p: p.produce('urbanpulse.bus_gps', key=bus['route_id'].encode(), value=val, callback=delivery_report)
                 else: print(f"[BUS] {val}")
                 
-            # 2. Signals
-            anomaly_gridlock = random.random() < 0.1
-            if anomaly_gridlock: gridlock_counter += 1
-            else: gridlock_counter = 0
-            
-            signal = generate_signals(anomaly_gridlock=(gridlock_counter > 0), gridlock_count=gridlock_counter)
+            # 2. Signals — emit 3 consecutive gridlock cycles periodically for Flink
+            gridlock_counter += 1
+            anomaly_gridlock = (gridlock_counter % 8) in (1, 2, 3)
+            signal = generate_signals(anomaly_gridlock=anomaly_gridlock, gridlock_count=gridlock_counter)
             val = json.dumps(signal)
             if p: p.produce('urbanpulse.signals', key=signal['junction_id'].encode(), value=val, callback=delivery_report)
             else: print(f"[SIGNAL] {val}")
             
             # 3. Air Quality
-            anomaly_aqi = random.random() < 0.05
+            anomaly_aqi = random.random() < 0.15
             aqi = generate_air_quality(anomaly_emergency=anomaly_aqi)
             val = json.dumps(aqi)
             if p: p.produce('urbanpulse.air_quality', key=aqi['sensor_id'].encode(), value=val, callback=delivery_report)
@@ -154,7 +152,11 @@ def main():
             if p: p.produce('urbanpulse.smart_meters', key=meter['ward_id'].encode(), value=val, callback=delivery_report)
             else: print(f"[METER] {val}")
 
-            if p: p.poll(0)
+            if p:
+                p.poll(0)
+                # Light progress so the mock terminal shows activity
+                if gridlock_counter % 5 == 0:
+                    print(f"[tick {gridlock_counter}] produced bus/signals/aqi/meters (aqi_alert={anomaly_aqi}, gridlock={anomaly_gridlock})")
             time.sleep(1)
             
         except KeyboardInterrupt:
