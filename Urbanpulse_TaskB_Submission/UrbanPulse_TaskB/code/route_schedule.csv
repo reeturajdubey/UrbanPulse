@@ -1,6 +1,0 @@
-route_id,route_name,scheduled_arrival_time,terminal
-R101,Andheri-Colaba Express,08:15:00,Colaba Terminal
-R102,Dadar-Bandra Link,08:30:00,Bandra Terminal
-R103,Kurla-Chembur Route,08:20:00,Chembur Terminal
-R104,Powai-Vikhroli Connector,08:45:00,Vikhroli Terminal
-R105,Thane-Ghatkopar Express,09:00:00,Ghatkopar Terminal
